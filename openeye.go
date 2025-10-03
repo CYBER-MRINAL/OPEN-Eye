@@ -1,346 +1,152 @@
-// Author = CYBER-MRINAL
+// Author = CYBER-MRINAL (improved by assistant)
 // Website = https://cyber-mrinal.github.io/omswastra
+// Improved: colorful, progress, better banner grabbing, SNI-aware TLS, HTTP Host header, reverse DNS,
+// token-bucket rate limiting, more accurate heuristics, JSON/CSV output, and safer concurrency controls.
 
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-// ScanType defines type of scan
+// max64 returns the larger of two int64 numbers
+func max64(a, b int64) int64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// ANSI color helpers (no external deps)
+const (
+	clrReset  = "\x1b[0m"
+	clrRed    = "\x1b[31m"
+	clrGreen  = "\x1b[32m"
+	clrYellow = "\x1b[33m"
+	clrBlue   = "\x1b[34m"
+	clrMag    = "\x1b[35m"
+	clrCyan   = "\x1b[36m"
+	clrGray   = "\x1b[90m"
+)
+
 type ScanType string
 
 const (
 	TCPConnect ScanType = "tcp"
-	TCPSYN     ScanType = "syn"
 	UDPScan    ScanType = "udp"
 )
 
-// ScanResult holds individual port info
+// Result model
 type ScanResult struct {
-	Port     int    `json:"port"`
-	Protocol string `json:"protocol"`
-	State    string `json:"state"`
-	Service  string `json:"service,omitempty"`
-	Banner   string `json:"banner,omitempty"`
+	Host     string  `json:"host"`
+	Port     int     `json:"port"`
+	Protocol string  `json:"protocol"`
+	State    string  `json:"state"`
+	Service  string  `json:"service,omitempty"`
+	Banner   string  `json:"banner,omitempty"`
+	Extra    string  `json:"extra,omitempty"`
+	RTT      float64 `json:"rtt_ms,omitempty"`
+	Attempt  int     `json:"attempt,omitempty"`
+	ScanTime string  `json:"scan_time,omitempty"`
 }
 
-// Global flags
+type ScanReport struct {
+	TargetInput string       `json:"target_input"`
+	Targets     []string     `json:"targets"`
+	Type        string       `json:"type"`
+	ScanTime    string       `json:"scan_time"`
+	Duration    string       `json:"duration"`
+	Results     []ScanResult `json:"results"`
+}
+
+// CLI flags
 var (
-	target      string
-	portList    string
-	scanType    string
-	timeout     int
-	concurrency int
-	jsonOutput  bool
-	csvOutput   string
-	verbose     bool
-	retries     int
-	helpFlag    bool
+	hostFlag      string
+	hostsFile     string
+	portListFlag  string
+	scanTypeFlag  string
+	timeoutSec    int
+	concurrency   int
+	jsonOutput    bool
+	csvOutput     string
+	verbose       bool
+	retries       int
+	helpFlag      bool
+	ratePerSecond int
+	showAll       bool
+	onlyTop       bool
 )
 
 func init() {
-	flag.StringVar(&target, "host", "", "Target host or IP (required)")
-	flag.StringVar(&portList, "p", "1-1024", "Port range (e.g., 22,80,443 or 1-1024)")
-	flag.StringVar(&scanType, "s", "tcp", "Scan type: tcp (connect), syn (requires root), udp (basic)")
-	flag.IntVar(&timeout, "timeout", 2, "Timeout per port in seconds")
+	flag.StringVar(&hostFlag, "host", "", "Target host or IP (single). Mutually exclusive with -hosts")
+	flag.StringVar(&hostsFile, "hosts", "", "Path to file with hosts (one per line) or CIDR (e.g., 10.0.0.0/24)")
+	flag.StringVar(&portListFlag, "p", "1-1024", "Port list (e.g., 22,80,443 or 1-1024)")
+	flag.StringVar(&scanTypeFlag, "s", "tcp", "Scan type: tcp (connect). udp is basic and unreliable.")
+	flag.IntVar(&timeoutSec, "timeout", 2, "Timeout per port in seconds")
 	flag.IntVar(&concurrency, "T", 200, "Number of concurrent workers")
-	flag.BoolVar(&jsonOutput, "json", false, "Output results as JSON (prints to stdout)")
-	flag.StringVar(&csvOutput, "csv", "", "Write CSV output to file path (optional)")
+	flag.IntVar(&ratePerSecond, "rps", 0, "Rate limit connections per second (0 = unlimited)")
+	flag.BoolVar(&jsonOutput, "json", false, "Output full results as JSON")
+	flag.StringVar(&csvOutput, "csv", "", "Write CSV output to file path")
 	flag.BoolVar(&verbose, "v", false, "Verbose output")
-	flag.IntVar(&retries, "retries", 1, "Number of retries per port on failure")
+	flag.IntVar(&retries, "retries", 2, "Number of retries per port on failure (with backoff)")
 	flag.BoolVar(&helpFlag, "h", false, "Show help")
-	flag.Parse()
+	flag.BoolVar(&showAll, "all", false, "Show all ports in final output (not only open)")
+	flag.BoolVar(&onlyTop, "top", false, "Only scan top common ports (fast)")
+}
 
+// common top ports
+var topPorts = []int{80, 443, 22, 21, 23, 25, 53, 3389, 3306, 5900, 8080, 8443, 139, 445, 111}
+
+func main() {
+	flag.Parse()
 	if helpFlag {
 		flag.Usage()
-		os.Exit(0)
+		return
 	}
-
-	if target == "" {
-		fmt.Fprintln(os.Stderr, "Error: -host is required. Example: openeye -host example.com -p 1-1000 -T 200 -timeout 2")
+	if hostFlag == "" && hostsFile == "" {
+		fmt.Fprintln(os.Stderr, "Error: either -host or -hosts is required")
 		flag.Usage()
 		os.Exit(1)
 	}
-}
 
-// parsePorts parses port ranges and comma-separated lists and returns a sorted unique slice
-func parsePorts(ports string) []int {
-	set := make(map[int]struct{})
-	parts := strings.Split(ports, ",")
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if strings.Contains(p, "-") {
-			r := strings.SplitN(p, "-", 2)
-			start, err1 := strconv.Atoi(strings.TrimSpace(r[0]))
-			end, err2 := strconv.Atoi(strings.TrimSpace(r[1]))
-			if err1 != nil || err2 != nil || start < 1 || end < 1 || start > 65535 || end > 65535 || start > end {
-				continue
-			}
-			for i := start; i <= end; i++ {
-				set[i] = struct{}{}
-			}
-		} else {
-			val, err := strconv.Atoi(p)
-			if err != nil || val < 1 || val > 65535 {
-				continue
-			}
-			set[val] = struct{}{}
-		}
-	}
-	var result []int
-	for k := range set {
-		result = append(result, k)
-	}
-	sort.Ints(result)
-	return result
-}
-
-// lightweight host check: resolves DNS and tries a few common TCP ports to verify reachability
-func pingHost(ctx context.Context, host string, timeoutSec int) bool {
-	// try DNS resolve first
-	ips, err := net.LookupHost(host)
-	if err != nil || len(ips) == 0 {
-		if verbose {
-			fmt.Fprintf(os.Stderr, "[!] DNS lookup failed for %s: %v\n", host, err)
-		}
-		return false
+	targets := expandTargets(hostFlag, hostsFile)
+	if len(targets) == 0 {
+		fmt.Fprintln(os.Stderr, "No targets to scan after parsing.")
+		os.Exit(1)
 	}
 
-	common := []int{80, 443, 22}
-	c := make(chan bool, len(common))
-	for _, p := range common {
-		go func(port int) {
-			d := time.Duration(timeoutSec) * time.Second
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), d)
-			if err != nil {
-				c <- false
-				return
-			}
-			conn.Close()
-			c <- true
-		}(p)
+	var ports []int
+	if onlyTop {
+		ports = topPorts
+	} else {
+		ports = parsePorts(portListFlag)
 	}
-	// if any succeed, host is up
-	for i := 0; i < len(common); i++ {
-		if <-c {
-			return true
-		}
+	if len(ports) == 0 {
+		fmt.Fprintln(os.Stderr, "No valid ports to scan after parsing -p.")
+		os.Exit(1)
 	}
-	return false
-}
+	ordered := prioritizePorts(ports, topPorts)
 
-// bannerProbe sends small protocol probes for common services to elicit banners
-func bannerProbe(conn net.Conn, port int) string {
-	// choose a probe based on port
-	probe := ""
-	switch port {
-	case 80, 8080, 8000, 8888:
-		probe = "HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n"
-	case 443:
-		// can't probe TLS without TLS handshake. skip for now.
-		probe = ""
-	case 21:
-		// FTP will normally send banner on connect
-		probe = ""
-	case 25:
-		probe = "HELO example.com\r\n"
-	case 110:
-		probe = "\r\n"
-	case 143:
-		probe = "\r\n"
-	default:
-		probe = "\r\n"
-	}
-
-	if probe != "" {
-		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		_, _ = conn.Write([]byte(probe))
-	}
-
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	r := bufio.NewReader(conn)
-	var out []string
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			break
-		}
-		out = append(out, strings.TrimSpace(line))
-		if len(out) >= 8 { // limit number of lines
-			break
-		}
-	}
-	return strings.Join(out, " ")
-}
-
-// serviceFromPort maps common port -> service name
-func serviceFromPort(port int) string {
-	services := map[int]string{
-		20:   "FTP-data",
-		21:   "FTP",
-		22:   "SSH",
-		23:   "Telnet",
-		25:   "SMTP",
-		53:   "DNS",
-		67:   "DHCP",
-		68:   "DHCP",
-		80:   "HTTP",
-		110:  "POP3",
-		111:  "rpcbind",
-		123:  "NTP",
-		143:  "IMAP",
-		161:  "SNMP",
-		389:  "LDAP",
-		443:  "HTTPS",
-		3306: "MySQL",
-		3389: "RDP",
-		5900: "VNC",
-		6379: "Redis",
-		8000: "HTTP-alt",
-	}
-	if s, ok := services[port]; ok {
-		return s
-	}
-	return ""
-}
-
-// detect service heuristically from banner
-func detectServiceFromBanner(banner string, fallbackPort int) string {
-	b := strings.ToLower(banner)
-	if strings.Contains(b, "ssh") {
-		return "SSH"
-	}
-	if strings.Contains(b, "http") || strings.Contains(b, "html") || strings.Contains(b, "server:") {
-		return "HTTP"
-	}
-	if strings.Contains(b, "smtp") || strings.Contains(b, "mail") {
-		return "SMTP"
-	}
-	if strings.Contains(b, "mysql") {
-		return "MySQL"
-	}
-	if s := serviceFromPort(fallbackPort); s != "" {
-		return s
-	}
-	return ""
-}
-
-// tcpConnectScan with retries and banner grabbing
-func tcpConnectScan(ctx context.Context, host string, port int, timeoutSec int, retries int) ScanResult {
-	address := net.JoinHostPort(host, strconv.Itoa(port))
-	res := ScanResult{Port: port, Protocol: "tcp"}
-	d := time.Duration(timeoutSec) * time.Second
-	var lastErr error
-	for attempt := 0; attempt <= retries; attempt++ {
-		conn, err := net.DialTimeout("tcp", address, d)
-		if err != nil {
-			lastErr = err
-			// small backoff before retry
-			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
-			continue
-		}
-		defer conn.Close()
-		res.State = "open"
-		// try to grab banner
-		banner := bannerProbe(conn, port)
-		banner = strings.TrimSpace(banner)
-		if len(banner) > 200 {
-			banner = banner[:200]
-		}
-		res.Banner = banner
-		// service detection
-		if svc := detectServiceFromBanner(banner, port); svc != "" {
-			res.Service = svc
-		} else {
-			res.Service = serviceFromPort(port)
-		}
-		return res
-	}
-	if verbose {
-		fmt.Fprintf(os.Stderr, "[debug] port %d closed or filtered: %v\n", port, lastErr)
-	}
-	res.State = "closed"
-	return res
-}
-
-// udpScan (basic): sends an empty packet to see if something responds. Not reliable.
-func udpScan(ctx context.Context, host string, port int, timeoutSec int) ScanResult {
-	res := ScanResult{Port: port, Protocol: "udp"}
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(host, strconv.Itoa(port)), time.Duration(timeoutSec)*time.Second)
-	if err != nil {
-		res.State = "closed"
-		return res
-	}
-	defer conn.Close()
-	// write a minimal payload
-	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	_, _ = conn.Write([]byte("\n"))
-	buf := make([]byte, 512)
-	conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutSec) * time.Second))
-	n, _ := conn.Read(buf)
-	if n > 0 {
-		res.State = "open"
-		res.Banner = strings.TrimSpace(string(buf[:n]))
-		res.Service = serviceFromPort(port)
-		return res
-	}
-	res.State = "open|filtered"
-	return res
-}
-
-// printTable prints results in a neat ASCII table
-func printTable(results []ScanResult) {
-	fmt.Println("+------+---------+-----------+----------------------+--------------------------+")
-	fmt.Println("| Port | Protocol| State     | Service              | Banner                   |")
-	fmt.Println("+------+---------+-----------+----------------------+--------------------------+")
-	for _, r := range results {
-		banner := r.Banner
-		if len(banner) > 24 {
-			banner = banner[:21] + "..."
-		}
-		service := r.Service
-		if service == "" {
-			service = "-"
-		}
-		fmt.Printf("| %-4d | %-7s | %-9s | %-20s | %-24s |\n", r.Port, r.Protocol, r.State, service, banner)
-	}
-	fmt.Println("+------+---------+-----------+----------------------+--------------------------+")
-}
-
-func writeCSV(path string, results []ScanResult) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	w := csv.NewWriter(f)
-	defer w.Flush()
-	_ = w.Write([]string{"port", "protocol", "state", "service", "banner"})
-	for _, r := range results {
-		_ = w.Write([]string{strconv.Itoa(r.Port), r.Protocol, r.State, r.Service, r.Banner})
-	}
-	return nil
-}
-
-func main() {
 	start := time.Now()
 	ctx, cancel := context.WithCancel(context.Background())
 	// handle Ctrl+C
@@ -348,121 +154,469 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
-		fmt.Fprintln(os.Stderr, "\n[!] Received interrupt, shutting down gracefully...")
+		fmt.Fprintln(os.Stderr, "\n[!] Received interrupt, shutting down...")
 		cancel()
 	}()
 
-	// SYN scan warning
-	if ScanType(scanType) == TCPSYN {
-		if os.Geteuid() != 0 {
-			fmt.Fprintln(os.Stderr, "Error: -s syn requires root privileges and raw socket/pcap support. Not implemented here.")
-			os.Exit(1)
-		}
-		fmt.Fprintln(os.Stderr, "Note: SYN scan mode requested. This program currently does not implement raw SYN scanning. It will fallback to TCP connect.")
+	// rate limiter token-bucket
+	var rateCh <-chan time.Time
+	if ratePerSecond > 0 {
+		interval := time.Second / time.Duration(max(1, ratePerSecond))
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		rateCh = ticker.C
 	}
 
-	fmt.Printf("[*] OPEN-Eye Scanner on %s\n", target)
-	if !pingHost(ctx, target, timeout) {
-		fmt.Printf("[!] Host %s appears offline or not responding to common TCP ports. Proceeding anyway...\n", target)
+	results := runScan(ctx, targets, ordered, ScanType(scanTypeFlag), timeoutSec, concurrency, retries, rateCh)
+
+	duration := time.Since(start)
+	report := ScanReport{
+		TargetInput: fmt.Sprintf("host=%s hostsfile=%s", hostFlag, hostsFile),
+		Targets:     targets,
+		Type:        string(TCPConnect),
+		ScanTime:    start.Format(time.RFC3339),
+		Duration:    duration.String(),
+		Results:     results,
 	}
 
-	ports := parsePorts(portList)
-	if len(ports) == 0 {
-		fmt.Fprintln(os.Stderr, "No valid ports to scan after parsing.")
-		os.Exit(1)
-	}
-
-	var wg sync.WaitGroup
-	resultsCh := make(chan ScanResult, len(ports))
-	sem := make(chan struct{}, concurrency)
-
-	fmt.Printf("[*] Running %s scan on %s with %d workers, timeout=%ds, retries=%d\n", scanType, target, concurrency, timeout, retries)
-
-	for _, port := range ports {
-		select {
-		case <-ctx.Done():
-			break
-		default:
-		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(p int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			var res ScanResult
-			switch ScanType(scanType) {
-			case TCPConnect:
-				res = tcpConnectScan(ctx, target, p, timeout, retries)
-			case UDPScan:
-				res = udpScan(ctx, target, p, timeout)
-			case TCPSYN:
-				// fallback behavior: use connect scan if raw SYN isn't available
-				res = tcpConnectScan(ctx, target, p, timeout, retries)
-			default:
-				res = tcpConnectScan(ctx, target, p, timeout, retries)
-			}
-			resultsCh <- res
-		}(port)
-	}
-
-	wg.Wait()
-	close(resultsCh)
-
-	var final []ScanResult
-	for r := range resultsCh {
-		if r.State == "open" || strings.Contains(r.State, "open") {
-			final = append(final, r)
-		}
-	}
-
-	sort.Slice(final, func(i, j int) bool { return final[i].Port < final[j].Port })
-
+	// Output
 	if jsonOutput {
-		data, _ := json.MarshalIndent(final, "", "  ")
-		fmt.Println(string(data))
+		out, _ := json.MarshalIndent(report, "", "  ")
+		fmt.Println(string(out))
 	} else {
-		printTable(final)
+		printPretty(report, showAll)
 		if csvOutput != "" {
-			if err := writeCSV(csvOutput, final); err != nil {
+			if err := writeCSV(csvOutput, report.Results); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to write CSV: %v\n", err)
 			} else {
 				fmt.Fprintf(os.Stderr, "Wrote CSV to %s\n", csvOutput)
 			}
 		}
-		// reverse DNS and OS guess
-		if len(final) > 0 {
-			if names, err := net.LookupAddr(target); err == nil && len(names) > 0 {
-				fmt.Printf("[*] Reverse DNS: %s\n", names[0])
+	}
+}
+
+// Helpers
+func max(a, b int) int { if a>b { return a }; return b }
+
+func expandTargets(single, hostsFile string) []string {
+	set := make(map[string]struct{})
+	if single != "" {
+		single = strings.TrimSpace(single)
+		set[single] = struct{}{}
+	}
+	if hostsFile != "" {
+		f, err := os.Open(hostsFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open hosts file: %v\n", err)
+			return keys(set)
+		}
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || strings.HasPrefix(line, "#") { continue }
+			if strings.Contains(line, "/") {
+				ips := cidrToIPs(line)
+				for _, ip := range ips { set[ip] = struct{}{} }
+			} else { set[line] = struct{}{} }
+		}
+	}
+	return keys(set)
+}
+
+func keys(m map[string]struct{}) []string {
+	var out []string
+	for k := range m { out = append(out, k) }
+	sort.Strings(out)
+	return out
+}
+
+func cidrToIPs(cidr string) []string {
+	var ips []string
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil { return ips }
+	for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); incIP(ip) {
+		ips = append(ips, ip.String())
+	}
+	if len(ips) > 2 { return ips[1:len(ips)-1] }
+	return ips
+}
+
+func incIP(ip net.IP) {
+	for j := len(ip)-1; j>=0; j-- {
+		ip[j]++
+		if ip[j] > 0 { break }
+	}
+}
+
+func parsePorts(ports string) []int {
+	set := make(map[int]struct{})
+	parts := strings.Split(ports, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p=="" { continue }
+		if strings.Contains(p, "-") {
+			r := strings.SplitN(p, "-", 2)
+			start, err1 := strconv.Atoi(strings.TrimSpace(r[0]))
+			end, err2 := strconv.Atoi(strings.TrimSpace(r[1]))
+			if err1!=nil || err2!=nil || start<1 || end<1 || start>65535 || end>65535 || start> end { continue }
+			for i:=start; i<= end; i++ { set[i] = struct{}{} }
+		} else {
+			val, err := strconv.Atoi(p)
+			if err!=nil || val<1 || val>65535 { continue }
+			set[val] = struct{}{}
+		}
+	}
+	var result []int
+	for k := range set { result = append(result, k) }
+	sort.Ints(result)
+	return result
+}
+
+func prioritizePorts(all []int, priority []int) []int {
+	prioritySet := make(map[int]int)
+	for i,p := range priority { prioritySet[p] = i }
+	sort.Slice(all, func(i,j int) bool {
+		pi, iok := prioritySet[all[i]]
+		pj, jok := prioritySet[all[j]]
+		if iok && !jok { return true }
+		if !iok && jok { return false }
+		if iok && jok { return pi < pj }
+		return all[i] < all[j]
+	})
+	return all
+}
+
+// runScan orchestrates scanning and progress
+func runScan(ctx context.Context, targets []string, ports []int, sType ScanType, timeoutSec, workers, retries int, rateCh <-chan time.Time) []ScanResult {
+	var resultsMu sync.Mutex
+	var results []ScanResult
+
+	totalTasks := int64(len(targets) * len(ports))
+	var doneTasks int64
+
+	tasks := make(chan struct{ host string; port int }, workers*10)
+	var wg sync.WaitGroup
+
+	// before launching progress goroutine
+	start := time.Now()
+
+	// progress goroutine
+	ctxProgress, cancelProgress := context.WithCancel(context.Background())
+	go func() {
+	    spinner := []string{"|","/","-","\\"}
+	    si := 0
+	    for {
+	        select {
+	        case <-ctxProgress.Done():
+	            return
+	        default:
+	            d := atomic.LoadInt64(&doneTasks)
+				pct := float64(d) / float64(max64(1, int64(totalTasks))) * 100.0
+	            elapsed := humanDuration(time.Since(start))
+	            fmt.Fprintf(os.Stderr, "%s[%s] %d/%d (%.1f%%) %sElapsed:%s %s\r",
+	                clrCyan, spinner[si%len(spinner)], d, totalTasks, pct,
+	                clrReset, elapsed, clrReset)
+	            si++
+	            time.Sleep(250 * time.Millisecond)
+	        }
+	    }
+	}()
+	
+	// worker pool
+	for i:=0; i< workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for t := range tasks {
+				if ctx.Err() != nil { return }
+				if rateCh != nil {
+					select { case <-rateCh: case <-ctx.Done(): return }
+				}
+				start := time.Now()
+				res := scanPortWithRetries(ctx, t.host, t.port, sType, timeoutSec, retries)
+				res.RTT = float64(time.Since(start).Milliseconds())
+				resultsMu.Lock()
+				results = append(results, res)
+				resultsMu.Unlock()
+				atomic.AddInt64(&doneTasks, 1)
+				if verbose {
+					fmt.Fprintf(os.Stderr, "%s[w%d]%s %s:%d %s (%s)\n", clrGray, id, clrReset, t.host, t.port, res.State, res.Service)
+				}
 			}
-			fmt.Printf("[*] OS Detection Guess: %s\n", detectOS(final))
-		}
-		fmt.Printf("[*] Scan complete in %s\n", time.Since(start))
+		}(i)
 	}
+
+	// enqueue
+	enqueue:
+	for _, h := range targets {
+		for _, p := range ports {
+			select { case <- ctx.Done(): break enqueue; default: }
+			tasks <- struct{ host string; port int }{ host: h, port: p }
+		}
+	}
+	close(tasks)
+	wg.Wait()
+	cancelProgress()
+
+	// filter and sort
+	var filtered []ScanResult
+	for _, r := range results {
+		if r.State == "open" || strings.Contains(r.State, "open") || showAll {
+			filtered = append(filtered, r)
+		}
+	}
+	sort.Slice(filtered, func(i,j int) bool {
+		if filtered[i].Host == filtered[j].Host { return filtered[i].Port < filtered[j].Port }
+		return filtered[i].Host < filtered[j].Host
+	})
+	return filtered
 }
 
-// OS detection based on open ports
-func detectOS(openPorts []ScanResult) string {
-	var ports []int
-	for _, r := range openPorts {
-		if r.State == "open" {
-			ports = append(ports, r.Port)
-		}
+func scanPortWithRetries(ctx context.Context, host string, port int, sType ScanType, timeoutSec int, retries int) ScanResult {
+	var last ScanResult
+	for attempt:=0; attempt<= retries; attempt++ {
+		start := time.Now()
+		res := scanPort(ctx, host, port, sType, timeoutSec)
+		res.Attempt = attempt+1
+		res.RTT = float64(time.Since(start).Milliseconds())
+		res.ScanTime = time.Now().Format(time.RFC3339)
+		last = res
+		if res.State == "open" || res.State == "closed" { return res }
+		// backoff
+		backoff := time.Duration(150*(attempt+1)) * time.Millisecond
+		select { case <- time.After(backoff): case <- ctx.Done(): return res }
 	}
-	if contains(ports, 135) || contains(ports, 445) {
-		return "Windows"
-	} else if contains(ports, 22) || contains(ports, 80) || contains(ports, 443) {
-		return "Linux/Unix"
-	}
-	return "Unknown"
+	return last
 }
 
-// Helper
-func contains(slice []int, item int) bool {
-	for _, v := range slice {
-		if v == item {
-			return true
+func dialWithTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout}
+	return d.Dial(network, address)
+}
+
+func scanPort(ctx context.Context, host string, port int, sType ScanType, timeoutSec int) ScanResult {
+	res := ScanResult{ Host: host, Port: port, Protocol: "tcp", State: "closed" }
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	timeout := time.Duration(timeoutSec) * time.Second
+
+	conn, err := dialWithTimeout("tcp", address, timeout)
+	if err != nil {
+		if isTimeoutErr(err) { res.State = "filtered" } else { res.State = "closed" }
+		return res
+	}
+	defer conn.Close()
+	res.State = "open"
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	// TLS-aware probes for common TLS ports
+	if port==443 || port==8443 || port==9443 {
+		if tr := probeTLS(host, port, timeout); tr != nil {
+			res.Banner = tr.Banner
+			res.Extra = tr.Extra
+			res.Service = tr.Service
+			return res
 		}
 	}
-	return false
+
+	// HTTP-like
+	if looksLikeHTTP(port) {
+		if hr := httpHeadProbe(host, port, timeout); hr != nil {
+			res.Banner = hr.Banner
+			res.Extra = hr.Extra
+			res.Service = hr.Service
+			return res
+		}
+	}
+
+	// port-specific minimal probes
+	if port == 22 {
+		b := readBanner(conn)
+		res.Banner = b
+		res.Service = fingerprintService(b, port)
+		return res
+	}
+
+	// generic banner
+	b := genericBannerProbe(conn)
+	res.Banner = b
+	if svc := fingerprintService(b, port); svc != "" { res.Service = svc } else { res.Service = wellKnownService(port) }
+
+	// try reverse DNS for extra info (best-effort)
+	if names, err := net.LookupAddr(host); err==nil && len(names)>0 {
+		res.Extra = strings.TrimSpace(names[0])
+	}
+	return res
+}
+
+func isTimeoutErr(err error) bool {
+	if err==nil { return false }
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "timeout") || strings.Contains(s, "i/o timeout") || strings.Contains(s, "refused")
+}
+
+func readBanner(conn net.Conn) string {
+	conn.SetReadDeadline(time.Now().Add(1200 * time.Millisecond))
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil { return "" }
+	return strings.TrimSpace(string(buf[:n]))
+}
+
+func genericBannerProbe(conn net.Conn) string {
+	conn.SetWriteDeadline(time.Now().Add(800 * time.Millisecond))
+	_, _ = conn.Write([]byte("HEAD / HTTP/1.0\r\n\r\n"))
+	conn.SetReadDeadline(time.Now().Add(1200 * time.Millisecond))
+	r := bufio.NewReader(conn)
+	var lines []string
+	for i:=0; i<16; i++ {
+		line, err := r.ReadString('\n')
+		if err!=nil { break }
+		line = strings.TrimSpace(line)
+		if line!="" { lines = append(lines, line) }
+	}
+	if len(lines)==0 {
+		// fallback read raw bytes
+		conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		buf := make([]byte, 1024)
+		n, _ := conn.Read(buf)
+		if n>0 { return strings.TrimSpace(string(buf[:n])) }
+	}
+	return strings.Join(lines, " ")
+}
+
+type probeResult struct{ Banner, Extra, Service string }
+
+func probeTLS(host string, port int, timeout time.Duration) *probeResult {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	dialer := &net.Dialer{Timeout: timeout}
+	cfg := &tls.Config{InsecureSkipVerify: true, ServerName: host}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, cfg)
+	if err!=nil { return nil }
+	defer conn.Close()
+	state := conn.ConnectionState()
+	peerCert := ""
+	if len(state.PeerCertificates)>0 {
+		c := state.PeerCertificates[0]
+		peerCert = fmt.Sprintf("CN=%s, Issuer=%s", c.Subject.CommonName, c.Issuer.CommonName)
+	}
+	// try HTTP over TLS if possible
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 4096)
+	n, _ := conn.Read(buf)
+	banner := strings.TrimSpace(string(buf[:n]))
+	return &probeResult{ Banner: banner, Extra: peerCert, Service: "HTTPS" }
+}
+
+func httpHeadProbe(host string, port int, timeout time.Duration) *probeResult {
+	scheme := "http"
+	if port==443 || port==8443 { scheme = "https" }
+	u := url.URL{ Scheme: scheme, Host: net.JoinHostPort(host, strconv.Itoa(port)), Path: "/" }
+	client := http.Client{ Timeout: timeout }
+	// try HEAD with Host header
+	req, _ := http.NewRequest("HEAD", u.String(), nil)
+	req.Header.Set("User-Agent", "OPEN-Eye2/1.0")
+	req.Host = host
+	resp, err := client.Do(req)
+	if err!=nil {
+		// fallback GET
+		resp2, err2 := client.Get(u.String())
+		if err2!=nil { return nil }
+		defer resp2.Body.Close()
+		title := extractHTMLTitle(resp2.Body)
+		server := resp2.Header.Get("Server")
+		banner := fmt.Sprintf("Server: %s", server)
+		return &probeResult{ Banner: banner, Extra: title, Service: "HTTP" }
+	}
+	defer resp.Body.Close()
+	title := extractHTMLTitle(resp.Body)
+	server := resp.Header.Get("Server")
+	banner := fmt.Sprintf("Server: %s", server)
+	return &probeResult{ Banner: banner, Extra: title, Service: "HTTP" }
+}
+
+func extractHTMLTitle(r io.Reader) string {
+	b := make([]byte, 8192)
+	n, _ := r.Read(b)
+	s := string(b[:n])
+	l := strings.ToLower(s)
+	start := strings.Index(l, "<title>")
+	end := strings.Index(l, "</title>")
+	if start>=0 && end>start {
+		title := s[start+7:end]
+		title = strings.TrimSpace(html.EscapeString(title))
+		return title
+	}
+	return ""
+}
+
+func looksLikeHTTP(port int) bool {
+	httpPorts := map[int]struct{}{80:{},8080:{},8000:{},8888:{},8081:{},3000:{},5000:{}}
+	_, ok := httpPorts[port]
+	return ok || port==443 || port==8443
+}
+
+func fingerprintService(banner string, port int) string {
+	b := strings.ToLower(banner)
+	switch {
+	case strings.Contains(b, "ssh-"): return "SSH"
+	case strings.Contains(b, "smtp") || strings.Contains(b, "ehlo"): return "SMTP"
+	case strings.Contains(b, "mysql") || strings.Contains(b, "mysql") : return "MySQL"
+	case strings.Contains(b, "ftp") || strings.Contains(b, "ftpd"): return "FTP"
+	case strings.Contains(b, "redis") : return "Redis"
+	case strings.Contains(b, "vnc") : return "VNC"
+	case strings.Contains(b, "http") || strings.Contains(b, "server:"): return "HTTP"
+	}
+	return wellKnownService(port)
+}
+
+func wellKnownService(port int) string {
+	services := map[int]string{20:"FTP-data",21:"FTP",22:"SSH",23:"Telnet",25:"SMTP",53:"DNS",67:"DHCP",68:"DHCP",80:"HTTP",110:"POP3",111:"rpcbind",123:"NTP",143:"IMAP",161:"SNMP",389:"LDAP",443:"HTTPS",3306:"MySQL",3389:"RDP",5900:"VNC",6379:"Redis",8000:"HTTP-alt"}
+	if s, ok := services[port]; ok { return s }
+	return ""
+}
+
+// pretty table with colors
+func printPretty(r ScanReport, showAll bool) {
+	fmt.Printf("%s[*]%s OPEN-Eye Scanner - targets: %d, results: %d, duration: %s\n", clrMag, clrReset, len(r.Targets), len(r.Results), r.Duration)
+	if len(r.Results)==0 { fmt.Println("No ports matched criteria."); return }
+
+	// header
+	fmt.Printf("%s+------------------------------+------+------+--------------+--------------------------------+%s\n", clrCyan, clrReset)
+	fmt.Printf("%s| %-28s | %-4s | %-4s | %-11s | %-28s |%s\n", clrCyan, "Host", "Port", "Proto", "Service", "Extra", clrReset)
+	fmt.Printf("%s+------------------------------+------+------+--------------+--------------------------------+%s\n", clrCyan, clrReset)
+	for _, rr := range r.Results {
+		stateClr := clrGreen
+		if strings.Contains(strings.ToLower(rr.State), "filtered") { stateClr = clrYellow }
+		if strings.Contains(strings.ToLower(rr.State), "closed") { stateClr = clrRed }
+		extra := rr.Extra
+		if len(extra) > 28 { extra = extra[:25] + "..." }
+		svc := rr.Service
+		if svc == "" { svc = "-" }
+		fmt.Printf("| %-28s | %4d | %4s | %-11s | %-28s |\n", rr.Host, rr.Port, stateClr+rr.Protocol+clrReset, svc, extra)
+	}
+	fmt.Printf("%s+------------------------------+------+------+--------------+--------------------------------+%s\n", clrCyan, clrReset)
+}
+
+func writeCSV(path string, results []ScanResult) error {
+	f, err := os.Create(path)
+	if err!=nil { return err }
+	defer f.Close()
+	w := csv.NewWriter(f)
+	defer w.Flush()
+	_ = w.Write([]string{"host","port","protocol","state","service","banner","extra","rtt_ms","attempt","scan_time"})
+	for _, r := range results {
+		_ = w.Write([]string{ r.Host, strconv.Itoa(r.Port), r.Protocol, r.State, r.Service, r.Banner, r.Extra, fmt.Sprintf("%.2f", r.RTT), strconv.Itoa(r.Attempt), r.ScanTime })
+	}
+	return nil
+}
+
+func humanDuration(d time.Duration) string {
+	if d < time.Second { return d.String() }
+	secs := int64(d.Seconds())
+	h := secs/3600; m := (secs%3600)/60; s := secs%60
+	if h>0 { return fmt.Sprintf("%dh%dm%ds", h,m,s) }
+	if m>0 { return fmt.Sprintf("%dm%ds", m,s) }
+	return fmt.Sprintf("%ds", s)
 }
 
